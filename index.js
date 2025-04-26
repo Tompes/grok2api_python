@@ -1317,6 +1317,55 @@ app.get('/v1/models', (req, res) => {
     });
 });
 
+app.get('/api/load_balancing_strategy', async (req, res) => {
+    try {
+        return res.json({
+            success: true,
+            strategy: tokenManager.strategy
+        });
+    } catch (error) {
+        Logger.error(`获取负载均衡策略时出错: ${error}`, 'Server');
+        return res.status(500).json({ error: `获取策略失败: ${error}` });
+    }
+});
+
+app.post('/api/load_balancing_strategy', async (req, res) => {
+    // 直接使用已有路由处理函数的逻辑
+    try {
+        const { strategy } = req.body;
+        if (!strategy) {
+            return res.status(400).json({ error: '缺少策略参数' });
+        }
+        
+        const normalizedStrategy = strategy.toUpperCase();
+        if (!['SEQUENTIAL', 'LEAST_USED', 'RANDOM', 'ROUND_ROBIN'].includes(normalizedStrategy)) {
+            return res.status(400).json({ 
+                error: `无效的策略: ${strategy}。支持的策略有: SEQUENTIAL, LEAST_USED, RANDOM, ROUND_ROBIN` 
+            });
+        }
+        
+        const oldStrategy = tokenManager.strategy;
+        tokenManager.strategy = normalizedStrategy;
+        
+        // 如果切换到 ROUND_ROBIN 策略，重置索引
+        if (normalizedStrategy === 'ROUND_ROBIN') {
+            tokenManager.roundRobinIndices = {};
+        }
+        
+        Logger.info(`令牌负载均衡策略已从 ${oldStrategy} 更改为 ${normalizedStrategy}`, 'Server');
+        
+        return res.json({
+            success: true,
+            message: `令牌负载均衡策略已更改为 ${normalizedStrategy}`,
+            old_strategy: oldStrategy,
+            new_strategy: normalizedStrategy
+        });
+    } catch (error) {
+        Logger.error(`设置负载均衡策略时出错: ${error}`, 'Server');
+        return res.status(500).json({ error: `设置策略失败: ${error}` });
+    }
+});
+
 app.post('/set/load_balancing_strategy', async (req, res) => {
     try {
         const { strategy } = req.body;

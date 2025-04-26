@@ -1401,6 +1401,23 @@ def chat_completions():
                 "type": "server_error"
             }}), response_status_code
 
+@app.route('/api/load_balancing_strategy', methods=['GET'])
+def get_load_balancing_strategy():
+    """获取当前负载均衡策略"""
+    try:
+        return jsonify({
+            "success": True,
+            "strategy": token_manager.strategy
+        })
+    except Exception as error:
+        logger.error(f"获取负载均衡策略时出错: {str(error)}", "Server")
+        return jsonify({"error": f"获取策略失败: {str(error)}"}), 500
+
+@app.route('/api/load_balancing_strategy', methods=['POST'])
+def api_set_load_balancing_strategy():
+    """API设置负载均衡策略（与前端兼容）"""
+    return set_load_balancing_strategy()
+
 @app.route('/set/load_balancing_strategy', methods=['POST'])
 def set_load_balancing_strategy():
     """设置令牌负载均衡策略"""
