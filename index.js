@@ -113,6 +113,17 @@ class AuthTokenManager {
         this.expiredTokens = new Set();
         this.tokenStatusMap = {};
 
+        // 负载均衡策略，支持 SEQUENTIAL（默认）、LEAST_USED、RANDOM 和 ROUND_ROBIN
+        this.strategy = (process.env.TOKEN_LOAD_BALANCING_STRATEGY || 'SEQUENTIAL').toUpperCase();
+        if (!['SEQUENTIAL', 'LEAST_USED', 'RANDOM', 'ROUND_ROBIN'].includes(this.strategy)) {
+            Logger.warning(`无效的 TOKEN_LOAD_BALANCING_STRATEGY: ${this.strategy}，使用默认值 SEQUENTIAL。`, 'TokenManager');
+            this.strategy = 'SEQUENTIAL';
+        }
+        Logger.info(`使用令牌选择策略: ${this.strategy}`, 'TokenManager');
+        
+        // 用于 ROUND_ROBIN 策略的模型索引记录
+        this.roundRobinIndices = {};
+
         // 定义模型请求频率限制和过期时间
         this.modelConfig = {
             "grok-2": {
@@ -287,38 +298,157 @@ class AuthTokenManager {
             return false;
         }
     }
+    getAvailableTokens(modelId) {
+        /**
+         * 获取模型当前可用的令牌列表，排除已超限的令牌
+         */
+        const normalizedModel = this.normalizeModelName(modelId);
+        
+        if (!this.tokenModelMap[normalizedModel]) {
+            return [];
+        }
+        
+        const availableTokens = [];
+        const requestFrequency = this.modelConfig[normalizedModel].RequestFrequency;
+        
+        for (const tokenEntry of this.tokenModelMap[normalizedModel]) {
+            const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
+            let isValidInStatus = true;
+            
+            if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][normalizedModel]) {
+                isValidInStatus = this.tokenStatusMap[sso][normalizedModel].isValid !== false;
+            }
+            
+            // 确保令牌未超限 - 既检查请求计数又检查状态标记
+            if ((tokenEntry.RequestCount < requestFrequency) && isValidInStatus) {
+                availableTokens.push(tokenEntry);
+            }
+        }
+        
+        return availableTokens;
+    }
+
     getNextTokenForModel(modelId) {
         const normalizedModel = this.normalizeModelName(modelId);
 
         if (!this.tokenModelMap[normalizedModel] || this.tokenModelMap[normalizedModel].length === 0) {
             return null;
         }
-        const tokenEntry = this.tokenModelMap[normalizedModel][0];
-
-        if (tokenEntry) {
-            if (tokenEntry.StartCallTime === null || tokenEntry.StartCallTime === undefined) {
-                tokenEntry.StartCallTime = Date.now();
+        
+        // 获取可用令牌
+        const availableTokens = this.getAvailableTokens(normalizedModel);
+        if (availableTokens.length === 0) {
+            return null;
+        }
+        
+        let selectedTokenEntry = null;
+        
+        // 根据负载均衡策略选择令牌
+        if (this.strategy === 'SEQUENTIAL') {
+            // 顺序选择（当前默认行为）
+            selectedTokenEntry = availableTokens[0];
+            
+        } else if (this.strategy === 'ROUND_ROBIN') {
+            // 轮询策略：依次选择每个令牌，使用索引来记录
+            if (!this.roundRobinIndices[normalizedModel]) {
+                this.roundRobinIndices[normalizedModel] = 0;
             }
-            if (!this.tokenResetSwitch) {
-                this.startTokenResetProcess();
-                this.tokenResetSwitch = true;
+                
+            if (availableTokens.length > 0) {
+                const currentIndex = this.roundRobinIndices[normalizedModel] % availableTokens.length;
+                selectedTokenEntry = availableTokens[currentIndex];
+                // 更新索引，为下一次选择准备
+                this.roundRobinIndices[normalizedModel] = (currentIndex + 1) % availableTokens.length;
             }
-            tokenEntry.RequestCount++;
-
-            if (tokenEntry.RequestCount > this.modelConfig[normalizedModel].RequestFrequency) {
-                this.removeTokenFromModel(normalizedModel, tokenEntry.token);
-                const nextTokenEntry = this.tokenModelMap[normalizedModel][0];
-                return nextTokenEntry ? nextTokenEntry.token : null;
-            }
-            const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
-            if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][normalizedModel]) {
-                if (tokenEntry.RequestCount === this.modelConfig[normalizedModel].RequestFrequency) {
-                    this.tokenStatusMap[sso][normalizedModel].isValid = false;
-                    this.tokenStatusMap[sso][normalizedModel].invalidatedTime = Date.now();
+            
+        } else if (this.strategy === 'LEAST_USED') {
+            // 选择使用次数最少的令牌
+            let minUsage = Number.MAX_SAFE_INTEGER;
+            for (const entry of availableTokens) {
+                const usage = entry.RequestCount || 0;
+                if (usage < minUsage) {
+                    minUsage = usage;
+                    selectedTokenEntry = entry;
                 }
-                this.tokenStatusMap[sso][normalizedModel].totalRequestCount++;
             }
-            return tokenEntry.token;
+            
+        } else if (this.strategy === 'RANDOM') {
+            // 随机选择一个可用令牌
+            const randomIndex = Math.floor(Math.random() * availableTokens.length);
+            selectedTokenEntry = availableTokens[randomIndex];
+        }
+        
+        // 使用选中的令牌
+        if (selectedTokenEntry) {
+            // 找到原始令牌在列表中的索引，以便更新原始对象
+            const token = selectedTokenEntry.token;
+            const tokenIndex = this.tokenModelMap[normalizedModel].findIndex(entry => entry.token === token);
+            
+            if (tokenIndex !== -1) {
+                const tokenEntry = this.tokenModelMap[normalizedModel][tokenIndex];
+                
+                if (tokenEntry.StartCallTime === null || tokenEntry.StartCallTime === undefined) {
+                    tokenEntry.StartCallTime = Date.now();
+                }
+                
+                if (!this.tokenResetSwitch) {
+                    this.startTokenResetProcess();
+                    this.tokenResetSwitch = true;
+                }
+                
+                tokenEntry.RequestCount++;
+                
+                const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
+                
+                // 检查令牌是否超限
+                if (tokenEntry.RequestCount >= this.modelConfig[normalizedModel].RequestFrequency) {
+                    // 立即标记为无效并从候选池移除
+                    if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][normalizedModel]) {
+                        this.tokenStatusMap[sso][normalizedModel].isValid = false;
+                        this.tokenStatusMap[sso][normalizedModel].invalidatedTime = Date.now();
+                        Logger.info(`令牌 ${sso.substring(0, 5)}... 已达到 ${normalizedModel} 的限制。已标记为无效。`, 'TokenManager');
+                    }
+                    
+                    // 移除超限令牌
+                    this.removeTokenFromModel(normalizedModel, tokenEntry.token);
+                    
+                    // 如果刚好是达到限制次数（而不是超过），我们仍然允许这次请求通过，但不再选择这个令牌
+                    if (tokenEntry.RequestCount === this.modelConfig[normalizedModel].RequestFrequency) {
+                        // 更新统计信息但允许此次请求通过
+                        if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][normalizedModel]) {
+                            this.tokenStatusMap[sso][normalizedModel].totalRequestCount++;
+                        }
+                        return tokenEntry.token;
+                    }
+                    
+                    // 如果已经超过限制，寻找下一个可用令牌
+                    const nextAvailable = this.getAvailableTokens(normalizedModel);
+                    if (nextAvailable.length === 0) {
+                        return null;
+                    }
+                    
+                    // 根据不同策略选择下一个令牌
+                    if (this.strategy === 'SEQUENTIAL') {
+                        return nextAvailable[0].token;
+                    } else if (this.strategy === 'ROUND_ROBIN') {
+                        // 重新计算 roundRobinIndex，因为可用令牌数量改变了
+                        if (nextAvailable.length > 0) {
+                            const currentIndex = this.roundRobinIndices[normalizedModel] % nextAvailable.length;
+                            return nextAvailable[currentIndex].token;
+                        }
+                        return null;
+                    }
+                    // 对于其他策略，下次调用时会重新评估
+                    return null;
+                }
+                
+                // 未超限，更新统计信息并返回令牌
+                if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][normalizedModel]) {
+                    this.tokenStatusMap[sso][normalizedModel].totalRequestCount++;
+                }
+                
+                return tokenEntry.token;
+            }
         }
 
         return null;
@@ -396,66 +526,87 @@ class AuthTokenManager {
         return this.tokenModelMap[normalizedModel] || [];
     }
 
+    resetExpiredTokens() {
+        /**
+         * 手动重置过期令牌，在定时器中调用或可以单独调用
+         */
+        const now = Date.now();
+
+        // 处理已标记为过期的令牌
+        this.expiredTokens.forEach(expiredTokenInfo => {
+            const { token, model, expiredTime } = expiredTokenInfo;
+            const expirationTime = this.modelConfig[model].ExpirationTime;
+            
+            // 检查令牌是否已经超过过期时间
+            if (now - expiredTime >= expirationTime) {
+                // 只有当令牌不在当前模型的活动列表中时，才添加回去
+                if (!this.tokenModelMap[model]?.some(entry => entry.token === token)) {
+                    if (!this.tokenModelMap[model]) {
+                        this.tokenModelMap[model] = [];
+                    }
+
+                    this.tokenModelMap[model].push({
+                        token: token,
+                        RequestCount: 0,
+                        AddedTime: now,
+                        StartCallTime: null
+                    });
+                    
+                    const sso = token.split("sso=")[1].split(";")[0];
+                    Logger.info(`令牌 ${sso.substring(0, 5)}... 在模型 ${model} 的限制已过期，已重新加入候选池。`, 'TokenManager');
+                }
+                
+                // 重置令牌状态
+                const sso = token.split("sso=")[1].split(";")[0];
+                if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][model]) {
+                    this.tokenStatusMap[sso][model].isValid = true;
+                    this.tokenStatusMap[sso][model].invalidatedTime = null;
+                    this.tokenStatusMap[sso][model].totalRequestCount = 0;
+                }
+
+                this.expiredTokens.delete(expiredTokenInfo);
+            }
+        });
+
+        // 检查每个模型的每个令牌的 StartCallTime
+        Object.keys(this.modelConfig).forEach(model => {
+            if (!this.tokenModelMap[model]) return;
+
+            const processedTokens = this.tokenModelMap[model].map(tokenEntry => {
+                if (!tokenEntry.StartCallTime) return tokenEntry;
+
+                const expirationTime = this.modelConfig[model].ExpirationTime;
+                if (now - tokenEntry.StartCallTime >= expirationTime) {
+                    const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
+                    if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][model]) {
+                        this.tokenStatusMap[sso][model].isValid = true;
+                        this.tokenStatusMap[sso][model].invalidatedTime = null;
+                        this.tokenStatusMap[sso][model].totalRequestCount = 0;
+                        Logger.info(`令牌 ${sso.substring(0, 5)}... 在模型 ${model} 的请求计数已重置。`, 'TokenManager');
+                    }
+                    
+                    return {
+                        ...tokenEntry,
+                        RequestCount: 0,
+                        StartCallTime: null
+                    };
+                }
+                
+                return tokenEntry;
+            });
+
+            this.tokenModelMap[model] = processedTokens;
+        });
+    }
+
     startTokenResetProcess() {
         if (this.tokenResetTimer) {
             clearInterval(this.tokenResetTimer);
         }
 
         this.tokenResetTimer = setInterval(() => {
-            const now = Date.now();
-
-            this.expiredTokens.forEach(expiredTokenInfo => {
-                const { token, model, expiredTime } = expiredTokenInfo;
-                const expirationTime = this.modelConfig[model].ExpirationTime;
-                if (now - expiredTime >= expirationTime) {
-                    if (!this.tokenModelMap[model].some(entry => entry.token === token)) {
-                        this.tokenModelMap[model].push({
-                            token: token,
-                            RequestCount: 0,
-                            AddedTime: now,
-                            StartCallTime: null
-                        });
-                    }
-                    const sso = token.split("sso=")[1].split(";")[0];
-
-                    if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][model]) {
-                        this.tokenStatusMap[sso][model].isValid = true;
-                        this.tokenStatusMap[sso][model].invalidatedTime = null;
-                        this.tokenStatusMap[sso][model].totalRequestCount = 0;
-                    }
-
-                    this.expiredTokens.delete(expiredTokenInfo);
-                }
-            });
-
-            Object.keys(this.modelConfig).forEach(model => {
-                if (!this.tokenModelMap[model]) return;
-    
-                const processedTokens = this.tokenModelMap[model].map(tokenEntry => {
-                    if (!tokenEntry.StartCallTime) return tokenEntry;
-    
-                    const expirationTime = this.modelConfig[model].ExpirationTime;
-                    if (now - tokenEntry.StartCallTime >= expirationTime) {
-                        const sso = tokenEntry.token.split("sso=")[1].split(";")[0];
-                        if (this.tokenStatusMap[sso] && this.tokenStatusMap[sso][model]) {
-                            this.tokenStatusMap[sso][model].isValid = true;
-                            this.tokenStatusMap[sso][model].invalidatedTime = null;
-                            this.tokenStatusMap[sso][model].totalRequestCount = 0;
-                        }
-                        
-                        return {
-                            ...tokenEntry,
-                            RequestCount: 0,
-                            StartCallTime: null
-                        };
-                    }
-                    
-                    return tokenEntry;
-                });
-    
-                this.tokenModelMap[model] = processedTokens;
-            });
-        }, 1 * 60 * 60 * 1000); 
+            this.resetExpiredTokens();
+        }, 1 * 60 * 60 * 1000); // 每小时执行一次
     }
 
     getAllTokens() {
@@ -1166,6 +1317,41 @@ app.get('/v1/models', (req, res) => {
     });
 });
 
+app.post('/set/load_balancing_strategy', async (req, res) => {
+    try {
+        const { strategy } = req.body;
+        if (!strategy) {
+            return res.status(400).json({ error: '缺少策略参数' });
+        }
+        
+        const normalizedStrategy = strategy.toUpperCase();
+        if (!['SEQUENTIAL', 'LEAST_USED', 'RANDOM', 'ROUND_ROBIN'].includes(normalizedStrategy)) {
+            return res.status(400).json({ 
+                error: `无效的策略: ${strategy}。支持的策略有: SEQUENTIAL, LEAST_USED, RANDOM, ROUND_ROBIN` 
+            });
+        }
+        
+        const oldStrategy = tokenManager.strategy;
+        tokenManager.strategy = normalizedStrategy;
+        
+        // 如果切换到 ROUND_ROBIN 策略，重置索引
+        if (normalizedStrategy === 'ROUND_ROBIN') {
+            tokenManager.roundRobinIndices = {};
+        }
+        
+        Logger.info(`令牌负载均衡策略已从 ${oldStrategy} 更改为 ${normalizedStrategy}`, 'Server');
+        
+        return res.json({
+            success: true,
+            message: `令牌负载均衡策略已更改为 ${normalizedStrategy}`,
+            old_strategy: oldStrategy,
+            new_strategy: normalizedStrategy
+        });
+    } catch (error) {
+        Logger.error(`设置负载均衡策略时出错: ${error}`, 'Server');
+        return res.status(500).json({ error: `设置策略失败: ${error}` });
+    }
+});
 
 app.post('/v1/chat/completions', async (req, res) => {
     try {

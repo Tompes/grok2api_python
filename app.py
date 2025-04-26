@@ -152,6 +152,15 @@ class AuthTokenManager:
         self.token_model_map = {}
         self.expired_tokens = set()
         self.token_status_map = {}
+        # 负载均衡策略，支持 SEQUENTIAL（默认）、LEAST_USED、RANDOM 和 ROUND_ROBIN
+        self.strategy = os.environ.get('TOKEN_LOAD_BALANCING_STRATEGY', 'SEQUENTIAL').upper()
+        if self.strategy not in ['SEQUENTIAL', 'LEAST_USED', 'RANDOM', 'ROUND_ROBIN']:
+            logger.warning(f"无效的 TOKEN_LOAD_BALANCING_STRATEGY: {self.strategy}，使用默认值 SEQUENTIAL。", "TokenManager")
+            self.strategy = 'SEQUENTIAL'
+        logger.info(f"使用令牌选择策略: {self.strategy}", "TokenManager")
+        
+        # 用于 ROUND_ROBIN 策略的模型索引记录
+        self.round_robin_indices = {}
 
         self.model_config = {
             "grok-2": {
@@ -287,42 +296,142 @@ class AuthTokenManager:
         except Exception as error:
             logger.error(f"重置校对token请求次数时发生错误: {str(error)}", "TokenManager")
             return False
+    def get_available_tokens(self, model_id):
+        """获取模型当前可用的令牌列表，排除已超限的令牌"""
+        normalized_model = self.normalize_model_name(model_id)
+        
+        if normalized_model not in self.token_model_map:
+            return []
+            
+        available_tokens = []
+        request_frequency = self.model_config[normalized_model]["RequestFrequency"]
+        
+        for token_entry in self.token_model_map[normalized_model]:
+            sso = token_entry["token"].split("sso=")[1].split(";")[0]
+            is_valid_in_status = True
+            
+            if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                is_valid_in_status = self.token_status_map[sso][normalized_model].get("isValid", True)
+            
+            # 确保令牌未超限 - 既检查请求计数又检查状态标记    
+            if token_entry["RequestCount"] < request_frequency and is_valid_in_status:
+                available_tokens.append(token_entry)
+                
+        return available_tokens
+
     def get_next_token_for_model(self, model_id, is_return=False):
         normalized_model = self.normalize_model_name(model_id)
 
         if normalized_model not in self.token_model_map or not self.token_model_map[normalized_model]:
             return None
-
-        token_entry = self.token_model_map[normalized_model][0]
+            
+        # 如果只需要返回当前令牌，不进行负载均衡选择
         if is_return:
-            return token_entry["token"]
+            # 获取所有可用令牌，如果没有可用令牌，则返回第一个令牌
+            available_tokens = self.get_available_tokens(normalized_model)
+            if available_tokens:
+                return available_tokens[0]["token"]
+            return self.token_model_map[normalized_model][0]["token"]
+            
+        # 获取可用令牌
+        available_tokens = self.get_available_tokens(normalized_model)
+        if not available_tokens:
+            return None
+            
+        selected_token_entry = None
+        
+        # 根据负载均衡策略选择令牌
+        if self.strategy == 'SEQUENTIAL':
+            # 顺序选择（当前默认行为）
+            selected_token_entry = available_tokens[0]
+            
+        elif self.strategy == 'ROUND_ROBIN':
+            # 轮询策略：依次选择每个令牌，使用索引来记录
+            if normalized_model not in self.round_robin_indices:
+                self.round_robin_indices[normalized_model] = 0
+                
+            if len(available_tokens) > 0:
+                current_index = self.round_robin_indices[normalized_model] % len(available_tokens)
+                selected_token_entry = available_tokens[current_index]
+                # 更新索引，为下一次选择准备
+                self.round_robin_indices[normalized_model] = (current_index + 1) % len(available_tokens)
+            
+        elif self.strategy == 'LEAST_USED':
+            # 选择使用次数最少的令牌
+            min_usage = float('inf')
+            for entry in available_tokens:
+                usage = entry.get("RequestCount", 0)
+                if usage < min_usage:
+                    min_usage = usage
+                    selected_token_entry = entry
+                    
+        elif self.strategy == 'RANDOM':
+            # 随机选择一个可用令牌
+            import random
+            selected_token_entry = random.choice(available_tokens)
+        
+        # 使用选中的令牌        
+        if selected_token_entry:
+            # 找到原始令牌在列表中的索引，以便更新原始对象
+            token = selected_token_entry["token"]
+            token_index = next((i for i, entry in enumerate(self.token_model_map[normalized_model]) 
+                               if entry["token"] == token), -1)
+            if token_index != -1:
+                token_entry = self.token_model_map[normalized_model][token_index]
+                
+                if token_entry["StartCallTime"] is None:
+                    token_entry["StartCallTime"] = int(time.time() * 1000)
 
-        if token_entry:
-            if token_entry["StartCallTime"] is None:
-                token_entry["StartCallTime"] = int(time.time() * 1000)
+                if not self.token_reset_switch:
+                    self.start_token_reset_process()
+                    self.token_reset_switch = True
 
-            if not self.token_reset_switch:
-                self.start_token_reset_process()
-                self.token_reset_switch = True
+                token_entry["RequestCount"] += 1
 
-            token_entry["RequestCount"] += 1
-
-            if token_entry["RequestCount"] > self.model_config[normalized_model]["RequestFrequency"]:
-                self.remove_token_from_model(normalized_model, token_entry["token"])
-                next_token_entry = self.token_model_map[normalized_model][0] if self.token_model_map[normalized_model] else None
-                return next_token_entry["token"] if next_token_entry else None
-
-            sso = token_entry["token"].split("sso=")[1].split(";")[0]
-            if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
-                if token_entry["RequestCount"] == self.model_config[normalized_model]["RequestFrequency"]:
-                    self.token_status_map[sso][normalized_model]["isValid"] = False
-                    self.token_status_map[sso][normalized_model]["invalidatedTime"] = int(time.time() * 1000)
-                self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
-
-                self.save_token_status()
-
-            return token_entry["token"]
-
+                sso = token_entry["token"].split("sso=")[1].split(";")[0]
+                
+                # 检查令牌是否超限
+                if token_entry["RequestCount"] >= self.model_config[normalized_model]["RequestFrequency"]:
+                    # 立即标记为无效并从候选池移除
+                    if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                        self.token_status_map[sso][normalized_model]["isValid"] = False
+                        self.token_status_map[sso][normalized_model]["invalidatedTime"] = int(time.time() * 1000)
+                        logger.info(f"令牌 {sso[:5]}... 已达到 {normalized_model} 的限制。已标记为无效。", "TokenManager")
+                    
+                    # 移除超限令牌
+                    self.remove_token_from_model(normalized_model, token_entry["token"])
+                    
+                    # 如果刚好是达到限制次数（而不是超过），我们仍然允许这次请求通过，但不再选择这个令牌
+                    if token_entry["RequestCount"] == self.model_config[normalized_model]["RequestFrequency"]:
+                        # 更新统计信息但允许此次请求通过
+                        if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                            self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
+                        return token_entry["token"]
+                    
+                    # 如果已经超过限制，寻找下一个可用令牌
+                    next_available = self.get_available_tokens(normalized_model)
+                    if not next_available:
+                        return None
+                        
+                    # 根据不同策略选择下一个令牌
+                    if self.strategy == 'SEQUENTIAL':
+                        return next_available[0]["token"] if next_available else None
+                    elif self.strategy == 'ROUND_ROBIN':
+                        # 重新计算 round_robin_index，因为可用令牌数量改变了
+                        if len(next_available) > 0:
+                            current_index = self.round_robin_indices.get(normalized_model, 0) % len(next_available)
+                            return next_available[current_index]["token"]
+                        return None
+                    # 对于其他策略，表示没有可用令牌了，下次调用时会重新评估
+                    return None
+                else:
+                    # 未超限，更新统计信息并返回令牌
+                    if sso in self.token_status_map and normalized_model in self.token_status_map[sso]:
+                        self.token_status_map[sso][normalized_model]["totalRequestCount"] += 1
+                    
+                    self.save_token_status()
+                    return token_entry["token"]
+                
         return None
 
     def remove_token_from_model(self, model_id, token):
@@ -383,61 +492,72 @@ class AuthTokenManager:
         normalized_model = self.normalize_model_name(model_id)
         return self.token_model_map.get(normalized_model, [])
 
-    def start_token_reset_process(self):
-        def reset_expired_tokens():
-            now = int(time.time() * 1000)
+    def reset_expired_tokens(self):
+        """手动重置过期令牌，在定时器中调用或可以单独调用"""
+        now = int(time.time() * 1000)
 
-            tokens_to_remove = set()
-            for token_info in self.expired_tokens:
-                token, model, expired_time = token_info
+        tokens_to_remove = set()
+        for token_info in self.expired_tokens:
+            token, model, expired_time = token_info
+            expiration_time = self.model_config[model]["ExpirationTime"]
+
+            # 检查令牌是否已经超过过期时间
+            if now - expired_time >= expiration_time:
+                # 只有当令牌不在当前模型的活动列表中时，才添加回去
+                if not any(entry["token"] == token for entry in self.token_model_map.get(model, [])):
+                    if model not in self.token_model_map:
+                        self.token_model_map[model] = []
+
+                    self.token_model_map[model].append({
+                        "token": token,
+                        "RequestCount": 0,
+                        "AddedTime": now,
+                        "StartCallTime": None
+                    })
+                    logger.info(f"令牌 {token.split('sso=')[1].split(';')[0][:5]}... 在模型 {model} 的限制已过期，已重新加入候选池。", "TokenManager")
+
+                # 重置令牌状态
+                sso = token.split("sso=")[1].split(";")[0]
+                if sso in self.token_status_map and model in self.token_status_map[sso]:
+                    self.token_status_map[sso][model]["isValid"] = True
+                    self.token_status_map[sso][model]["invalidatedTime"] = None
+                    self.token_status_map[sso][model]["totalRequestCount"] = 0
+
+                tokens_to_remove.add(token_info)
+
+        # 从过期列表中移除已重置的令牌
+        self.expired_tokens -= tokens_to_remove
+
+        # 同时检查每个模型的每个令牌的 StartCallTime
+        for model in self.model_config.keys():
+            if model not in self.token_model_map:
+                continue
+
+            for token_entry in self.token_model_map[model]:
+                if not token_entry.get("StartCallTime"):
+                    continue
+
                 expiration_time = self.model_config[model]["ExpirationTime"]
-
-                if now - expired_time >= expiration_time:
-                    if not any(entry["token"] == token for entry in self.token_model_map.get(model, [])):
-                        if model not in self.token_model_map:
-                            self.token_model_map[model] = []
-
-                        self.token_model_map[model].append({
-                            "token": token,
-                            "RequestCount": 0,
-                            "AddedTime": now,
-                            "StartCallTime": None
-                        })
-
-                    sso = token.split("sso=")[1].split(";")[0]
+                if now - token_entry["StartCallTime"] >= expiration_time:
+                    sso = token_entry["token"].split("sso=")[1].split(";")[0]
                     if sso in self.token_status_map and model in self.token_status_map[sso]:
                         self.token_status_map[sso][model]["isValid"] = True
                         self.token_status_map[sso][model]["invalidatedTime"] = None
                         self.token_status_map[sso][model]["totalRequestCount"] = 0
+                        logger.info(f"令牌 {sso[:5]}... 在模型 {model} 的请求计数已重置。", "TokenManager")
 
-                    tokens_to_remove.add(token_info)
+                    token_entry["RequestCount"] = 0
+                    token_entry["StartCallTime"] = None
+        
+        # 保存更新后的状态
+        self.save_token_status()
 
-            self.expired_tokens -= tokens_to_remove
-
-            for model in self.model_config.keys():
-                if model not in self.token_model_map:
-                    continue
-
-                for token_entry in self.token_model_map[model]:
-                    if not token_entry.get("StartCallTime"):
-                        continue
-
-                    expiration_time = self.model_config[model]["ExpirationTime"]
-                    if now - token_entry["StartCallTime"] >= expiration_time:
-                        sso = token_entry["token"].split("sso=")[1].split(";")[0]
-                        if sso in self.token_status_map and model in self.token_status_map[sso]:
-                            self.token_status_map[sso][model]["isValid"] = True
-                            self.token_status_map[sso][model]["invalidatedTime"] = None
-                            self.token_status_map[sso][model]["totalRequestCount"] = 0
-
-                        token_entry["RequestCount"] = 0
-                        token_entry["StartCallTime"] = None
-
+    def start_token_reset_process(self):
         import threading
         # 启动一个线程执行定时任务，每小时执行一次
         def run_timer():
             while True:
-                reset_expired_tokens()
+                self.reset_expired_tokens()
                 time.sleep(3600)
 
         timer_thread = threading.Thread(target=run_timer)
@@ -610,33 +730,12 @@ class GrokApiClient:
         except Exception as error:
             logger.error(str(error), "Server")
             return ''
-    # def convert_system_messages(self, messages):
-    #     try:
-    #         system_prompt = []
-    #         i = 0
-    #         while i < len(messages):
-    #             if messages[i].get('role') != 'system':
-    #                 break
-
-    #             system_prompt.append(self.process_message_content(messages[i].get('content')))
-    #             i += 1
-
-    #         messages = messages[i:]
-    #         system_prompt = '\n'.join(system_prompt)
-
-    #         if not messages:
-    #             raise ValueError("没有找到用户或者AI消息")
-    #         return {"system_prompt":system_prompt,"messages":messages}
-    #     except Exception as error:
-    #         logger.error(str(error), "Server")
-    #         raise ValueError(error)
     def prepare_chat_request(self, request):
         if ((request["model"] == 'grok-2-imageGen' or request["model"] == 'grok-3-imageGen') and
             not CONFIG["API"]["PICGO_KEY"] and not CONFIG["API"]["TUMY_KEY"] and
             request.get("stream", False)):
             raise ValueError("该模型流式输出需要配置PICGO或者TUMY图床密钥!")
 
-        # system_message, todo_messages = self.convert_system_messages(request["messages"]).values()
         todo_messages = request["messages"]
         if request["model"] in ['grok-2-imageGen', 'grok-3-imageGen', 'grok-3-deepsearch']:
             last_message = todo_messages[-1]
@@ -1301,6 +1400,37 @@ def chat_completions():
                 "message": str(error),
                 "type": "server_error"
             }}), response_status_code
+
+@app.route('/set/load_balancing_strategy', methods=['POST'])
+def set_load_balancing_strategy():
+    """设置令牌负载均衡策略"""
+    try:
+        data = request.json
+        if not data or 'strategy' not in data:
+            return jsonify({"error": "缺少策略参数"}), 400
+            
+        strategy = data['strategy'].upper()
+        if strategy not in ['SEQUENTIAL', 'LEAST_USED', 'RANDOM', 'ROUND_ROBIN']:
+            return jsonify({"error": f"无效的策略: {strategy}。支持的策略有: SEQUENTIAL, LEAST_USED, RANDOM, ROUND_ROBIN"}), 400
+            
+        old_strategy = token_manager.strategy
+        token_manager.strategy = strategy
+        
+        # 如果切换到 ROUND_ROBIN 策略，重置索引
+        if strategy == 'ROUND_ROBIN':
+            token_manager.round_robin_indices = {}
+            
+        logger.info(f"令牌负载均衡策略已从 {old_strategy} 更改为 {strategy}", "Server")
+        
+        return jsonify({
+            "success": True,
+            "message": f"令牌负载均衡策略已更改为 {strategy}",
+            "old_strategy": old_strategy,
+            "new_strategy": strategy
+        })
+    except Exception as error:
+        logger.error(f"设置负载均衡策略时出错: {str(error)}", "Server")
+        return jsonify({"error": f"设置策略失败: {str(error)}"}), 500
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
